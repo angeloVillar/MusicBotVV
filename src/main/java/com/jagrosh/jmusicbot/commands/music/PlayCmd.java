@@ -38,10 +38,9 @@ import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.exceptions.PermissionException;
 
 import com.github.topi314.lavasrc.spotify.SpotifySourceManager;
-import java.io.IOException;
 import java.lang.reflect.Field;
 import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.logging.Logger;
 
 /**
  *
@@ -49,8 +48,9 @@ import java.util.regex.Pattern;
  */
 public class PlayCmd extends MusicCommand
 {
-    private final static String LOAD = "\uD83D\uDCE5"; // 📥
-    private final static String CANCEL = "\uD83D\uDEAB"; // 🚫
+    private static final String LOAD = "\uD83D\uDCE5"; // 📥
+    private static final String CANCEL = "\uD83D\uDEAB"; // 🚫
+    private static final Logger LOGGER = Logger.getLogger(PlayCmd.class.getName());
 
     private final String loadingEmoji;
 
@@ -72,18 +72,12 @@ public class PlayCmd extends MusicCommand
     {
         try {
             // Spotify Workaround
-            final Matcher spotifyMatcher = SpotifySourceManager.URL_PATTERN.matcher(event.getArgs());
-            if (spotifyMatcher.find()) {
-                final Field argField = event.getClass().getDeclaredField("args");
-                argField.setAccessible(true);
-                final String arg = (String) argField.get(event);
-                final String region = spotifyMatcher.group("region");
-                if (region == null || region.isEmpty()) {
-                    argField.set(event, arg.replace("spotify.com/", "spotify.com/intl/"));
-                } else if (!region.equals("intl")) argField.set(event, arg.replace(region, "intl"));
-            }
-
+            final Field argField = event.getClass().getDeclaredField("args");
+            argField.setAccessible(true);
+            final String arg = (String) argField.get(event);
+            argField.set(event, applySpotifyWorkaround(arg));
         } catch (Exception ignored) {
+            LOGGER.severe("Failed to apply Spotify workaround");
         }
         String argsIn = event.getArgs();
         if(argsIn.isEmpty() && event.getMessage().getAttachments().isEmpty())
@@ -108,9 +102,14 @@ public class PlayCmd extends MusicCommand
             event.reply(builder.toString());
             return;
         }
-        String args = event.getArgs().startsWith("<") && event.getArgs().endsWith(">")
-                ? event.getArgs().substring(1,event.getArgs().length()-1)
-                : event.getArgs().isEmpty() ? event.getMessage().getAttachments().get(0).getUrl() : event.getArgs();
+        String args;
+        if (event.getArgs().startsWith("<") && event.getArgs().endsWith(">")) {
+            args = event.getArgs().substring(1, event.getArgs().length() - 1);
+        } else if (event.getArgs().isEmpty()) {
+            args = event.getMessage().getAttachments().get(0).getUrl();
+        } else {
+            args = event.getArgs();
+        }
         event.reply(loadingEmoji+" Loading... `["+args+"]`", m -> bot.getPlayerManager().loadItemOrdered(event.getGuild(), args, new ResultHandler(m,event,false)));
     }
 
@@ -154,9 +153,11 @@ public class PlayCmd extends MusicCommand
                                 m.editMessage(addMsg+"\n"+event.getClient().getSuccess()+" Loaded **"+loadPlaylist(playlist, track)+"** additional tracks!").queue();
                             else
                                 m.editMessage(addMsg).queue();
-                        }).setFinalAction(m ->
+                        }).setFinalAction(message ->
                         {
-                            try{ m.clearReactions().queue(); }catch(PermissionException ignore) {}
+                            try{ message.clearReactions().queue(); } catch(PermissionException ignore) {
+                                LOGGER.severe("PermissionException clearing reactions in PlayCmd.ResultHandler.loadSingle");
+                            }
                         }).build().display(m);
             }
         }
@@ -164,7 +165,7 @@ public class PlayCmd extends MusicCommand
         private int loadPlaylist(AudioPlaylist playlist, AudioTrack exclude)
         {
             int[] count = {0};
-            playlist.getTracks().stream().forEach((track) -> {
+            playlist.getTracks().stream().forEach(track -> {
                 if(!bot.getConfig().isTooLong(track) && !track.equals(exclude))
                 {
                     AudioHandler handler = (AudioHandler)event.getGuild().getAudioManager().getSendingHandler();
@@ -182,40 +183,48 @@ public class PlayCmd extends MusicCommand
         }
 
         @Override
-        public void playlistLoaded(AudioPlaylist playlist)
-        {
-            if(playlist.getTracks().size()==1 || playlist.isSearchResult())
-            {
-                AudioTrack single = playlist.getSelectedTrack()==null ? playlist.getTracks().get(0) : playlist.getSelectedTrack();
-                loadSingle(single, null);
+        public void playlistLoaded(AudioPlaylist playlist) {
+            if (playlist.getTracks().size() == 1 || playlist.isSearchResult()) {
+                handleSingleTrackPlaylist(playlist);
+            } else if (playlist.getSelectedTrack() != null) {
+                loadSingle(playlist.getSelectedTrack(), playlist);
+            } else {
+                handleMultipleTracksPlaylist(playlist);
             }
-            else if (playlist.getSelectedTrack()!=null)
-            {
-                AudioTrack single = playlist.getSelectedTrack();
-                loadSingle(single, playlist);
+        }
+
+        private void handleSingleTrackPlaylist(AudioPlaylist playlist) {
+            AudioTrack single = playlist.getSelectedTrack() == null ? playlist.getTracks().get(0) : playlist.getSelectedTrack();
+            loadSingle(single, null);
+        }
+
+        private void handleMultipleTracksPlaylist(AudioPlaylist playlist) {
+            int count = loadPlaylist(playlist, null);
+            if (playlist.getTracks().isEmpty()) {
+                handleEmptyPlaylist(playlist);
+            } else if (count == 0) {
+                handleAllTracksTooLong(playlist);
+            } else {
+                handleSuccessfullyLoadedPlaylist(playlist, count);
             }
-            else
-            {
-                int count = loadPlaylist(playlist, null);
-                if(playlist.getTracks().size() == 0)
-                {
-                    m.editMessage(FormatUtil.filter(event.getClient().getWarning()+" The playlist "+(playlist.getName()==null ? "" : "(**"+playlist.getName()
-                            +"**) ")+" could not be loaded or contained 0 entries")).queue();
-                }
-                else if(count==0)
-                {
-                    m.editMessage(FormatUtil.filter(event.getClient().getWarning()+" All entries in this playlist "+(playlist.getName()==null ? "" : "(**"+playlist.getName()
-                            +"**) ")+"were longer than the allowed maximum (`"+bot.getConfig().getMaxTime()+"`)")).queue();
-                }
-                else
-                {
-                    m.editMessage(FormatUtil.filter(event.getClient().getSuccess()+" Found "
-                            +(playlist.getName()==null?"a playlist":"playlist **"+playlist.getName()+"**")+" with `"
-                            + playlist.getTracks().size()+"` entries; added to the queue!"
-                            + (count<playlist.getTracks().size() ? "\n"+event.getClient().getWarning()+" Tracks longer than the allowed maximum (`"
-                            + bot.getConfig().getMaxTime()+"`) have been omitted." : ""))).queue();
-                }
-            }
+        }
+
+        private void handleEmptyPlaylist(AudioPlaylist playlist) {
+            m.editMessage(FormatUtil.filter(event.getClient().getWarning() + " The playlist " + (playlist.getName() == null ? "" : "(**" + playlist.getName()
+                    + "**) ") + " could not be loaded or contained 0 entries")).queue();
+        }
+
+        private void handleAllTracksTooLong(AudioPlaylist playlist) {
+            m.editMessage(FormatUtil.filter(event.getClient().getWarning() + " All entries in this playlist " + (playlist.getName() == null ? "" : "(**" + playlist.getName()
+                    + "**) ") + "were longer than the allowed maximum (`" + bot.getConfig().getMaxTime() + "`)")).queue();
+        }
+
+        private void handleSuccessfullyLoadedPlaylist(AudioPlaylist playlist, int count) {
+            m.editMessage(FormatUtil.filter(event.getClient().getSuccess() + " Found "
+                    + (playlist.getName() == null ? "a playlist" : "playlist **" + playlist.getName() + "**") + " with `"
+                    + playlist.getTracks().size() + "` entries; added to the queue!"
+                    + (count < playlist.getTracks().size() ? "\n" + event.getClient().getWarning() + " Tracks longer than the allowed maximum (`"
+                    + bot.getConfig().getMaxTime() + "`) have been omitted." : ""))).queue();
         }
 
         @Override
@@ -253,41 +262,24 @@ public class PlayCmd extends MusicCommand
         @Override
         public void doCommand(CommandEvent event)
         {
-            if(event.getArgs().isEmpty())
-            {
-                event.reply(event.getClient().getError()+" Please include a playlist name.");
+            if (event.getArgs().isEmpty()) {
+                event.reply(event.getClient().getError() + " Please include a playlist name.");
                 return;
             }
             Playlist playlist = bot.getPlaylistLoader().getPlaylist(event.getArgs());
 
             for (int i = 0; i < playlist.getItems().size(); i++) {
                 String item = playlist.getItems().get(i);
-                String modifiedItem = item; // Start with the original item
-
-                // Apply Spotify workaround
-                final Matcher spotifyMatcher = SpotifySourceManager.URL_PATTERN.matcher(item);
-                if (spotifyMatcher.find()) {
-                    String region = spotifyMatcher.group("region");
-                    if (region == null || region.isEmpty()) {
-                        modifiedItem = item.replace("spotify.com/", "spotify.com/intl/");
-                    } else if (!region.equals("intl")) {
-                        modifiedItem = item.replace(region, "intl");
-                    }
-                }
+                String modifiedItem = applySpotifyWorkaround(item);
 
                 // Update the item in the existing playlist
                 playlist.getItems().set(i, modifiedItem);
             }
 
-            if(playlist==null)
-            {
-                event.replyError("I could not find `"+event.getArgs()+".txt` in the Playlists folder.");
-                return;
-            }
             event.getChannel().sendMessage(loadingEmoji+" Loading playlist **"+event.getArgs()+"**... ("+playlist.getItems().size()+" items)").queue(m ->
             {
                 AudioHandler handler = (AudioHandler)event.getGuild().getAudioManager().getSendingHandler();
-                playlist.loadTracks(bot.getPlayerManager(), (at)->handler.addTrack(new QueuedTrack(at, RequestMetadata.fromResultHandler(at, event))), () -> {
+                playlist.loadTracks(bot.getPlayerManager(), at->handler.addTrack(new QueuedTrack(at, RequestMetadata.fromResultHandler(at, event))), () -> {
                     StringBuilder builder = new StringBuilder(playlist.getTracks().isEmpty()
                             ? event.getClient().getWarning()+" No tracks were loaded!"
                             : event.getClient().getSuccess()+" Loaded **"+playlist.getTracks().size()+"** tracks!");
@@ -302,4 +294,18 @@ public class PlayCmd extends MusicCommand
             });
         }
     }
+
+    public static String applySpotifyWorkaround(String input) {
+        final Matcher spotifyMatcher = SpotifySourceManager.URL_PATTERN.matcher(input);
+        if (spotifyMatcher.find()) {
+            String region = spotifyMatcher.group("region");
+            if (region == null || region.isEmpty()) {
+                return input.replace("spotify.com/", "spotify.com/intl/");
+            } else if (!region.equals("intl")) {
+                return input.replace(region, "intl");
+            }
+        }
+        return input;
+    }
+
 }
